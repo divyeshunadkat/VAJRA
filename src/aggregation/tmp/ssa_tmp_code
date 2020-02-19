@@ -1,0 +1,379 @@
+#define SSA_UNSUPPORTED_INSTRUCTIONS( InstTYPE, Inst )                  \
+  if(llvm::isa<llvm::InstTYPE>(Inst) ) {                                \
+    std::cerr << "Occuring in block:\n";                                \
+    LLVM_DUMP_MARKED( Inst->getParent() )                               \
+    LLVM_DUMP_MARKED( Inst )                                            \
+    tiler_error( "array_ssa::", "Unsupported instruction!!");           \
+  }
+
+
+// =============================================================================
+// Another way of renaming by traversing each stmt in the blocks
+// =============================================================================
+
+void array_ssa::processBlock( bb* b ) {
+  assert( b );
+
+  for( llvm::Instruction& Iobj : b->getInstList() ) {
+    llvm::Instruction* I = &(Iobj);
+    if( auto unary = llvm::dyn_cast<llvm::UnaryInstruction>(I) ) {
+      processUnaryInst( unary );
+    } else if(auto bop = llvm::dyn_cast<llvm::BinaryOperator>(I) ) {
+      // processBinOp( bop );
+    } else if( auto phi = llvm::dyn_cast<llvm::PHINode>(I) ) {
+      // processPhiNode( phi );
+    } else if( auto cmp = llvm::dyn_cast<llvm::CmpInst>(I) ) {
+      // processCmpInst( cmp );
+    } else if( auto call = llvm::dyn_cast<llvm::CallInst>(I) ) {
+      // processCallInst(call);
+    } else if( auto store = llvm::dyn_cast<llvm::StoreInst>(I) ) {
+      // Processed this before processing the whole block
+      // processStoreInst( store );
+    } else if( auto gep = llvm::dyn_cast<llvm::GetElementPtrInst>(I) ) {
+      // processGetElementPtrInst( gep );
+    } else if( auto terminate = llvm::dyn_cast<llvm::TerminatorInst>(I) ) {
+      // processTerminatorInst( terminate );
+    } else {
+      SSA_UNSUPPORTED_INSTRUCTIONS( FuncletPadInst,     I);
+      // todo: cases for funclet CleanupPadInst, CatchPadInst
+      SSA_UNSUPPORTED_INSTRUCTIONS( BinaryOperator,     I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( FenceInst,          I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( AtomicCmpXchgInst,  I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( AtomicRMWInst,      I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( SelectInst,         I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( ExtractElementInst, I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( InsertElementInst,  I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( ShuffleVectorInst,  I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( InsertValueInst,    I);
+      SSA_UNSUPPORTED_INSTRUCTIONS( LandingPadInst,     I);
+      LLVM_DUMP_MARKED( I );
+      tiler_error("array_ssa::", "Unsupported instruction");
+    }
+  }
+}
+
+void array_ssa::processStoreInst(llvm::StoreInst* store, loopdata* ld) {
+  assert( store );
+  auto val = store->getOperand(0);
+  auto addr = store->getOperand(1);
+  if( auto gep = llvm::dyn_cast<llvm::GetElementPtrInst>(addr) ) {
+    llvm::AllocaInst* arry_alloca = llvm::dyn_cast<llvm::AllocaInst>
+      (gep->getPointerOperand());
+    if(!is_updated_once(arry_alloca)) {
+      set_updated(arry_alloca);
+      continue;
+    } else {
+      llvm::AllocaInst* new_arry_alloca = create_new_alloca(arry_alloca);
+      set_updated(new_arry_alloca);
+      remap_store(store, arry_alloca, new_arry_alloca);
+      update_prev_curr_maps(arry_alloca, new_arry_alloca);
+    }
+    if(ld != NULL && arry_alloca->isStaticAlloca()) {
+      llvm::BasicBlock* pre_header = ld->loop->getLoopPreheader();
+      if(!pre_header) tiler_error("array_ssa::", "Unique preheader block not found");
+      add_equality_stmt(pre_header, prev_arr_map[arry_alloca],
+                        new_arry_alloca, o.globalContext);
+    } else {}
+  } else if(llvm::isa<llvm::GlobalVariable>(addr)) {
+    // Currently doing nothing for the global scalars
+  } else {
+    LLVM_DUMP_MARKED( store );
+    tiler_error("array_ssa::", "Only array and global write/read supported!");
+  }
+}
+
+void array_ssa::processCastInst( llvm::CastInst* cast ) {
+  assert( cast );
+  if( auto trunc = llvm::dyn_cast<llvm::TruncInst>(cast) ) {
+    auto v = trunc->getOperand(0);
+    if( v->getType()->isIntegerTy(8) && cast->getType()->isIntegerTy(1) ) {
+    }
+  } else if( auto zext = llvm::dyn_cast<llvm::ZExtInst>(cast) ) {
+    auto v = zext->getOperand(0);
+    auto v_ty = v->getType();
+    auto c_ty = cast->getType();
+    // Current policy allow extensions [ 1 -> 8, 1->32, 32->64]
+    if( (v_ty->isIntegerTy(1) && c_ty->isIntegerTy(8)) ||
+        (v_ty->isIntegerTy(1) && c_ty->isIntegerTy(32)) ||
+        (v_ty->isIntegerTy(32) && c_ty->isIntegerTy(64)) ) {
+    } else {
+      tiler_error("array_ssa::", "zero extn instruction of unsupported size");
+    }
+  } else if( auto sext = llvm::dyn_cast<llvm::SExtInst>(cast) ) {
+    auto v = sext->getOperand(0);
+    auto v_ty = v->getType();
+    auto c_ty = cast->getType();
+    // Current policy allow extensions [ 1 -> 8, 1->32, 32->64]
+    if( (v_ty->isIntegerTy(1) && c_ty->isIntegerTy(8)) ||
+        (v_ty->isIntegerTy(1) && c_ty->isIntegerTy(32)) ||
+        (v_ty->isIntegerTy(32) && c_ty->isIntegerTy(64)) ) {
+    } else {
+      tiler_error("bmc", "sign extn instruction of unsupported size");
+    }
+  } else if( auto bcast = llvm::dyn_cast<llvm::BitCastInst>(cast) ) {
+    processBitCastInst(bcast);
+  } else {
+    SSA_UNSUPPORTED_INSTRUCTIONS( FPTruncInst,       cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( FPExtInst,         cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( UIToFPInst,        cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( SIToFPInst,        cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( FPToUIInst,        cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( FPToSIInst,        cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( IntToPtrInst,      cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( PtrToIntInst,      cast);
+    SSA_UNSUPPORTED_INSTRUCTIONS( AddrSpaceCastInst, cast);
+    LLVM_DUMP_MARKED( cast );
+    tiler_error("array_ssa::", "cast instruction is not recognized !!");
+  }
+}
+
+void array_ssa::processBitCastInst(llvm::BitCastInst* bitCast) {
+  assert( bitCast );
+}
+
+void array_ssa::processAllocaInst(llvm::AllocaInst* alloca) {
+  assert( alloca );
+}
+
+void array_ssa::processLoadInst( llvm::LoadInst* load ) {
+  assert( load );
+  auto addr = load->getOperand(0);
+  if( auto gep = llvm::dyn_cast<llvm::GetElementPtrInst>(addr) ) {
+    auto idx = gep->getOperand(1);
+    if(gep->getNumIndices() == 2) idx = gep->getOperand(2);
+  } else if(llvm::isa<llvm::GlobalVariable>(addr)) {
+    //    tiler_error("bmc", "non array global write/read not supported!");
+  } else {
+    LLVM_DUMP_MARKED( load );
+    tiler_error("array_ssa::", "Only array and global write/read supported!");
+  }
+}
+
+void array_ssa::processUnaryInst( llvm::UnaryInstruction*  I) {
+  if( auto cast = llvm::dyn_cast<llvm::CastInst>(I) ) {
+    processCastInst( cast );
+  } else if( auto alloca = llvm::dyn_cast<llvm::AllocaInst>(I) ) {
+    processAllocaInst(alloca);
+  } else if( auto load = llvm::dyn_cast<llvm::LoadInst>(I) ) {
+    processLoadInst(load);
+  } else {
+    SSA_UNSUPPORTED_INSTRUCTIONS( VAArgInst,        I );
+    SSA_UNSUPPORTED_INSTRUCTIONS( ExtractValueInst, I );
+    LLVM_DUMP_MARKED(I);
+    tiler_error("array_ssa::", "unsupported unary instruction!!");
+  }
+}
+
+void array_ssa::processGetElementPtrInst(llvm::GetElementPtrInst* gep) {
+  assert( gep );
+  // GEP processed inside load and store inst
+  // as gep always follows them
+}
+
+void array_ssa::processBranch( llvm::BranchInst* br ) {
+  assert( br );
+  // if( !br->isUnconditional() ) {
+  // } else {}
+}
+
+void array_ssa::processRetInst(llvm::ReturnInst *ret) {
+  assert( ret );
+  // llvm::Value* v = ret->getReturnValue();
+}
+
+void array_ssa::processSwitchInst(llvm::SwitchInst *swch) {
+  assert( swch );
+  tiler_error("array_ssa::","Switch instructions are currently not supported");
+}
+
+void array_ssa::processUnreachableInst(llvm::UnreachableInst *I) {
+  // do nothing
+}
+
+void array_ssa::processTerminatorInst(llvm::TerminatorInst *I) {
+  assert( I );
+
+  if( auto swch = llvm::dyn_cast<llvm::SwitchInst>(I) ) {
+    processSwitchInst(swch);
+  } else if( auto ret = llvm::dyn_cast<llvm::ReturnInst>(I) ) {
+    processRetInst( ret );
+  } else if( auto br = llvm::dyn_cast<llvm::BranchInst>(I) ) {
+    processBranch( br );
+  } else if( auto unreach = llvm::dyn_cast<llvm::UnreachableInst>(I) ) {
+    processUnreachableInst(unreach);
+  } else {
+    SSA_UNSUPPORTED_INSTRUCTIONS( IndirectBrInst,    I );
+    SSA_UNSUPPORTED_INSTRUCTIONS( InvokeInst,        I );
+    SSA_UNSUPPORTED_INSTRUCTIONS( ResumeInst,        I );
+    SSA_UNSUPPORTED_INSTRUCTIONS( CatchSwitchInst,   I );
+    SSA_UNSUPPORTED_INSTRUCTIONS( CatchReturnInst,   I );
+    SSA_UNSUPPORTED_INSTRUCTIONS( CleanupReturnInst, I );
+    tiler_error( "array_ssa::", "Unsupported terminator instruction!");
+  }
+}
+
+void array_ssa::processBinOp(llvm::BinaryOperator* bop) {
+  assert( bop );
+  auto op0 = bop->getOperand( 0 );
+  auto op1 = bop->getOperand( 1 );
+  unsigned op = bop->getOpcode();
+  switch( op ) {
+  case llvm::Instruction::Add : break;
+  case llvm::Instruction::Sub : break;
+  case llvm::Instruction::Mul : break;
+  case llvm::Instruction::SDiv: break;
+  case llvm::Instruction::UDiv: break;
+  case llvm::Instruction::And : break;
+  case llvm::Instruction::Or  : break;
+  case llvm::Instruction::Xor :
+  case llvm::Instruction::SRem:
+  case llvm::Instruction::URem:
+  case llvm::Instruction::FAdd:
+  case llvm::Instruction::FSub:
+  case llvm::Instruction::FDiv:
+  case llvm::Instruction::FRem:
+  default: {
+    char* opName = bop->getOpcodeName();
+    tiler_error("array_ssa::", "unsupported instruction \"" << opName << "\" occurred!!");
+  }
+  }
+}
+
+void array_ssa::processCmpInst( llvm::CmpInst* cmp) {
+  assert( cmp );
+  // todo: two cases of cmp ICmpInst and FCmpInst
+  // figure out which one is actually supported
+  llvm::Value* lhs = cmp->getOperand( 0 ),* rhs = cmp->getOperand( 1 );
+  llvm::CmpInst::Predicate pred = cmp->getPredicate();
+  switch( pred ) {
+  case llvm::CmpInst::ICMP_EQ  :  break;
+  case llvm::CmpInst::ICMP_NE  :  break;
+  case llvm::CmpInst::ICMP_UGT :  break;
+  case llvm::CmpInst::ICMP_UGE :  break;
+  case llvm::CmpInst::ICMP_ULT :  break;
+  case llvm::CmpInst::ICMP_ULE :  break;
+  case llvm::CmpInst::ICMP_SGT :  break;
+  case llvm::CmpInst::ICMP_SGE :  break;
+  case llvm::CmpInst::ICMP_SLT :  break;
+  case llvm::CmpInst::ICMP_SLE :  break;
+  default: {
+    tiler_error("array_ssa::", "unsupported predicate in compare " << pred << "!!");
+  }
+  }
+}
+
+void array_ssa::processAssume(llvm::CallInst* call) {
+  assert(call);
+}
+
+bool array_ssa::is_assume(llvm::CallInst* call) {
+  assert( call );
+  llvm::Function* fp = call->getCalledFunction();
+  if( fp != NULL &&
+      (fp->getName() == "_Z6assumeb" || fp->getName() == "assume" ) ) {
+    return true;
+  } else if (fp == NULL) {
+    llvm::Value * val = call->getCalledValue();
+    if( auto CE = llvm::dyn_cast<llvm::ConstantExpr>(val) ) {
+      if(CE->isCast()) {
+        if(CE->getOperand(0)->getName() == "assume" ||
+                  CE->getOperand(0)->getName() == "_Z6assumeb") {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+void array_ssa::processAssert(llvm::CallInst* call) {
+  assert( call );
+}
+
+bool array_ssa::is_assert(llvm::CallInst* call ) {
+  assert( call );
+  llvm::Function* fp = call->getCalledFunction();
+  if( fp != NULL &&
+      (fp->getName() == "_Z6assertb" || fp->getName() == "assert" ) ) {
+    return true;
+  } else if (fp == NULL) {
+    llvm::Value * val = call->getCalledValue();
+    if( auto CE = llvm::dyn_cast<llvm::ConstantExpr>(val) ) {
+      if(CE->isCast()) {
+        if(CE->getOperand(0)->getName() == "assert" ||
+           CE->getOperand(0)->getName() == "_Z6assertb") {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+void array_ssa::processPhiNode( llvm::PHINode* phi ) {
+  assert( phi );
+}
+
+void array_ssa::processNondet(llvm::CallInst* call) {
+  assert(call);
+  tiler_error("array_ssa::", "Unsupported instruction - nondet");
+}
+
+void array_ssa::processIntrinsicInst( llvm::IntrinsicInst* I ) {
+  //do nothing
+  if( auto dbg = llvm::dyn_cast<llvm::DbgInfoIntrinsic>(I) ) {
+    // do nothing
+    // processDebugInfo( dbg );
+  }else if( I->getIntrinsicID() == llvm::Intrinsic::stacksave ) {
+    // do nothing
+  }else if( I->getIntrinsicID() == llvm::Intrinsic::stackrestore ) {
+    // do nothing
+  }else if( I->getIntrinsicID() == llvm::Intrinsic::lifetime_start ) {
+    // do nothing
+  }else if( I->getIntrinsicID() == llvm::Intrinsic::lifetime_end ) {
+    // do nothing
+  }else{
+    SSA_UNSUPPORTED_INSTRUCTIONS( ConstrainedFPIntrinsic, I);
+#ifndef LLVM_SVN
+    SSA_UNSUPPORTED_INSTRUCTIONS( AtomicMemCpyInst, I);
+    SSA_UNSUPPORTED_INSTRUCTIONS( AtomicMemMoveInst, I);
+    SSA_UNSUPPORTED_INSTRUCTIONS( AtomicMemSetInst, I);
+#endif
+    SSA_UNSUPPORTED_INSTRUCTIONS( MemIntrinsic, I);
+    SSA_UNSUPPORTED_INSTRUCTIONS( VAStartInst, I);
+    SSA_UNSUPPORTED_INSTRUCTIONS( VAEndInst, I);
+    SSA_UNSUPPORTED_INSTRUCTIONS( VACopyInst, I);
+    SSA_UNSUPPORTED_INSTRUCTIONS( InstrProfIncrementInst, I);
+    SSA_UNSUPPORTED_INSTRUCTIONS( InstrProfValueProfileInst, I);
+    I->print( llvm::outs() );
+    tiler_error("array_ssa::", "Unsupported intrinsics!");
+  }
+}
+
+void array_ssa::processCallInst( llvm::CallInst* call ) {
+  assert(call);
+  llvm::Function* fp = call->getCalledFunction();
+
+  if( auto dbg_val = llvm::dyn_cast<llvm::IntrinsicInst>(call) ) {
+    processIntrinsicInst( dbg_val );
+  } else if( fp != NULL && fp->getName().startswith("__VERIFIER") ) {
+    if( fp != NULL && fp->getName().startswith("__VERIFIER_nondet_") ) {
+      processNondet( call);
+    } else if ( fp != NULL && fp->getName().startswith("__VERIFIER_error") ) {
+      //VERIFIER_error always has an unreachable instruction which is handled
+    } else if ( fp != NULL && fp->getName().startswith("__VERIFIER_assert") ) {
+      processAssert ( call);
+    } else if ( fp != NULL && fp->getName().startswith("__VERIFIER_assume") ) {
+      processAssume( call);
+    } else { //only error and nondets handled
+      tiler_error("array_ssa::",
+                  "Only __VERIFIER_[assert,error,nondet_TY] functions are handled!");
+    }
+  } else if(is_assert(call)) {
+    processAssert(call);
+  } else if (is_assume(call)) {
+    processAssume( call);
+  } else {
+    tiler_error("array_ssa::", "function call is not recognized !!");
+  }
+}
