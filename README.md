@@ -1,4 +1,5 @@
 # VAJRA
+https://doi.org/10.6084/m9.figshare.11875428.v1
 
 VAJRA is the implementation that accompanies our paper:
 "Verifying Array Manipulating Programs with Full-program Induction". Supratik Chakraborty, Ashutosh Gupta, Divyesh Unadkat. In TACAS 2020. 
